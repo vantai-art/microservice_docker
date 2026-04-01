@@ -1,0 +1,254 @@
+
+
+services:
+
+  # ══════════════════════════════════════════
+  # DATABASES
+  # ══════════════════════════════════════════
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-multi-db.sh:/docker-entrypoint-initdb.d/init.sh
+    ports: ["5432:5432"]
+    networks: [micronet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7-jammy
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo
+      MONGO_INITDB_ROOT_PASSWORD: mongo
+    volumes: [mongo_data:/data/db]
+    ports: ["27017:27017"]
+    networks: [micronet]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: mysql
+      MYSQL_DATABASE: notifdb
+    volumes: [mysql_data:/var/lib/mysql]
+    ports: ["3306:3306"]
+    networks: [micronet]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pmysql"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports: ["6379:6379"]
+    networks: [micronet]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════
+  # LOG SERVICE (starts first — all others depend on it)
+  # ══════════════════════════════════════════
+
+  log-service:
+    build: ./log-service
+    container_name: log-service
+    ports: ["8006:8006"]
+    environment:
+      PORT: 8006
+    volumes: [log_data:/app/src/logs]
+    networks: [micronet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8006/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ══════════════════════════════════════════
+  # AUTH SERVICE — Java / Spring Boot
+  # ══════════════════════════════════════════
+
+  auth-service:
+    build: ./auth-service
+    container_name: auth-service
+    ports: ["8001:8001"]
+    environment:
+      DB_HOST: postgres
+      DB_USER: postgres
+      DB_PASS: postgres
+      JWT_SECRET: superSecretKey1234567890123456789012345
+      LOG_SERVICE_URL: http://log-service:8006
+    depends_on:
+      postgres:    { condition: service_healthy }
+      log-service: { condition: service_healthy }
+    networks: [micronet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8001/api/auth/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ══════════════════════════════════════════
+  # PRODUCT SERVICE — Python / FastAPI
+  # ══════════════════════════════════════════
+
+  product-service:
+    build: ./product-service
+    container_name: product-service
+    ports: ["8002:8002"]
+    environment:
+      MONGO_URL: mongodb://mongo:mongo@mongodb:27017
+      LOG_SERVICE_URL: http://log-service:8006
+    depends_on:
+      mongodb:     { condition: service_healthy }
+      log-service: { condition: service_healthy }
+    networks: [micronet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ══════════════════════════════════════════
+  # ORDER SERVICE — C# / .NET 8
+  # ══════════════════════════════════════════
+
+  order-service:
+    build: ./order-service
+    container_name: order-service
+    ports: ["8003:8003"]
+    environment:
+      DB_HOST: postgres
+      DB_USER: postgres
+      DB_PASS: postgres
+      LOG_SERVICE_URL: http://log-service:8006
+    depends_on:
+      postgres:    { condition: service_healthy }
+      log-service: { condition: service_healthy }
+    networks: [micronet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8003/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ══════════════════════════════════════════
+  # PAYMENT SERVICE — Go / Gin
+  # ══════════════════════════════════════════
+
+  payment-service:
+    build: ./payment-service
+    container_name: payment-service
+    ports: ["8004:8004"]
+    environment:
+      PORT: 8004
+      LOG_SERVICE_URL: http://log-service:8006
+    depends_on:
+      log-service: { condition: service_healthy }
+    networks: [micronet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8004/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ══════════════════════════════════════════
+  # NOTIFICATION SERVICE — PHP / Laravel 11
+  # ══════════════════════════════════════════
+
+  notification-service:
+    build: ./notification-service
+    container_name: notification-service
+    ports: ["8005:8005"]
+    environment:
+      APP_KEY: base64:superSecretAppKey1234567890abcdef==
+      APP_ENV: production
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: notifdb
+      DB_USERNAME: root
+      DB_PASSWORD: mysql
+      LOG_SERVICE_URL: http://log-service:8006
+      REDIS_HOST: redis
+      CACHE_DRIVER: redis
+      QUEUE_CONNECTION: redis
+    depends_on:
+      mysql:       { condition: service_healthy }
+      redis:       { condition: service_healthy }
+      log-service: { condition: service_healthy }
+    networks: [micronet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8005/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ══════════════════════════════════════════
+  # API GATEWAY — Node.js / Express
+  # ══════════════════════════════════════════
+
+  api-gateway:
+    build: ./api-gateway
+    container_name: api-gateway
+    ports: ["8000:8000"]
+    environment:
+      PORT: 8000
+      JWT_SECRET: superSecretKey1234567890123456789012345
+      AUTH_SERVICE_URL:         http://auth-service:8001
+      PRODUCT_SERVICE_URL:      http://product-service:8002
+      ORDER_SERVICE_URL:        http://order-service:8003
+      PAYMENT_SERVICE_URL:      http://payment-service:8004
+      NOTIFICATION_SERVICE_URL: http://notification-service:8005
+      LOG_SERVICE_URL:          http://log-service:8006
+    depends_on:
+      auth-service:         { condition: service_healthy }
+      product-service:      { condition: service_healthy }
+      order-service:        { condition: service_healthy }
+      payment-service:      { condition: service_healthy }
+      notification-service: { condition: service_healthy }
+      log-service:          { condition: service_healthy }
+    networks: [micronet]
+    restart: unless-stopped
+
+# ══════════════════════════════════════════
+# VOLUMES & NETWORK
+# ══════════════════════════════════════════
+
+volumes:
+  postgres_data:
+  mongo_data:
+  mysql_data:
+  log_data:
+
+networks:
+  micronet:
+    driver: bridge
